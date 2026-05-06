@@ -32,7 +32,6 @@
         }
         .container{max-width:1380px;margin:0 auto}
 
-        /* RESPONSIVE : Mobile */
         @media (max-width: 640px) {
             body { padding: 1rem; }
             .auth-bar { flex-direction: column; align-items: stretch; }
@@ -58,7 +57,6 @@
             .sub { font-size: 0.8rem; }
         }
 
-        /* Styles inchangés pour desktop */
         .auth-bar {display:flex;justify-content:flex-end;align-items:center;flex-wrap:wrap;gap:1rem;margin-bottom:1rem;background:white;padding:.5rem 1.2rem;border-radius:var(--r-lg);border:1px solid var(--border);}
         .user-info {font-size:.8rem;font-weight:600;color:var(--green);flex-grow:1; display:flex; align-items:center; gap:0.5rem;}
         .sync-badge {background:var(--green-pale); color:var(--green); border-radius:var(--r-pill); padding:0.2rem 0.6rem; font-size:0.7rem; font-weight:500;}
@@ -161,8 +159,6 @@
         <div class="user-info" id="userInfo">🔒 Mode Local sécurisé</div>
         <button class="btn data-btn" id="exportDataBtn">💾 Exporter (JSON)</button>
         <button class="btn data-btn" id="importDataBtn">📂 Importer (JSON)</button>
-        <button class="btn data-btn" id="syncToCloudBtn" style="display:none;">☁️ Sauvegarder sur Cloud</button>
-        <button class="btn data-btn" id="syncFromCloudBtn" style="display:none;">⬇️ Charger depuis Cloud</button>
         <button class="btn primary" id="loginBtn">Connexion Cloud</button>
         <button class="btn primary" id="logoutBtn" style="display:none;">Déconnexion</button>
         <input type="file" id="importFileInput" style="display:none;" accept=".json">
@@ -275,6 +271,9 @@ let currentTenues = [];
 let occasionTypes = [...DEFAULT_OCCASIONS];
 let weatherCache = new Map();
 
+// Pour éviter les boucles de synchronisation
+let ignoreNextSnapshot = false;
+
 // UTILS
 function toast(msg){
     const c = document.getElementById("toast-container");
@@ -346,6 +345,7 @@ function safeLoadLocalData() {
 
 // FIREBASE
 let auth = null, db = null, currentUser = null;
+let unsubscribeSnapshot = null; // pour le listener Firestore
 
 try {
     if(typeof firebase !== "undefined") {
@@ -361,37 +361,55 @@ try {
         auth = firebase.auth();
         db   = firebase.firestore();
         
-        auth.onAuthStateChanged(async user => {
+        auth.onAuthStateChanged(user => {
+            // Désabonnement de l'ancien listener s'il existe
+            if(unsubscribeSnapshot) {
+                unsubscribeSnapshot();
+                unsubscribeSnapshot = null;
+            }
             currentUser = user;
-            const syncToBtn = document.getElementById("syncToCloudBtn");
-            const syncFromBtn = document.getElementById("syncFromCloudBtn");
             if(user) {
                 const userSpan = document.getElementById("userInfo");
-                userSpan.innerHTML = `☁️ Connecté (${user.email}) <span class="sync-badge">✓ synchronisation Cloud active</span>`;
+                userSpan.innerHTML = `☁️ Connecté (${user.email}) <span class="sync-badge">🔄 synchronisation temps réel active</span>`;
                 document.getElementById("loginBtn").style.display = "none";
                 document.getElementById("logoutBtn").style.display = "inline-block";
-                if(syncToBtn) syncToBtn.style.display = "inline-block";
-                if(syncFromBtn) syncFromBtn.style.display = "inline-block";
                 
-                try {
-                    const doc = await db.collection("travelDatas").doc(user.uid).get();
-                    if(!doc.exists) {
-                        if(confirm("Aucune sauvegarde Cloud trouvée. Voulez-vous synchroniser vos données locales actuelles sur le Cloud ? (recommandé)")) {
-                            await pushToCloud();
-                            toast("✅ Données locales poussées vers le Cloud !");
+                // Lancer l'écoute des changements Cloud
+                unsubscribeSnapshot = db.collection("travelDatas").doc(user.uid)
+                    .onSnapshot(doc => {
+                        if(ignoreNextSnapshot) {
+                            // Ce snapshot a été déclenché par notre propre sauvegarde, on l'ignore
+                            ignoreNextSnapshot = false;
+                            return;
                         }
-                    } else {
-                        toast("✅ Connecté au Cloud. Vos modifications seront automatiquement synchronisées.");
-                    }
-                } catch(err) {
-                    console.warn("Erreur vérification Cloud", err);
-                }
+                        if(doc.exists) {
+                            const data = doc.data();
+                            // Appliquer les données du Cloud en local
+                            if(data.wardrobe) {
+                                for(let key in DEFAULT_WARDROBE)
+                                    if(Array.isArray(data.wardrobe[key])) wardrobe[key] = data.wardrobe[key];
+                            }
+                            if(Array.isArray(data.tenues)) currentTenues = data.tenues;
+                            if(Array.isArray(data.occasions) && data.occasions.length) occasionTypes = data.occasions;
+                            migrateTenues();
+                            if(data.config) applyConfigData(data.config);
+                            // Sauvegarder en local et rafraîchir l'interface
+                            saveLocalOnly(); // on évite de repousser vers le Cloud
+                            renderAll();
+                            toast("🔄 Données mises à jour depuis le Cloud");
+                        }
+                    }, error => {
+                        console.warn("Erreur écoute Cloud:", error);
+                        toast("⚠️ Perte de synchronisation temps réel. Vérifiez votre connexion.");
+                    });
+                
+                // Première synchronisation : si local plus récent, on pousse, sinon on tire (le listener s'en chargera)
+                // Le listener ci-dessus va immédiatement recevoir l'état actuel du document, donc on laisse faire.
+                toast("✅ Synchronisation automatique activée entre vos appareils.");
             } else {
-                document.getElementById("userInfo").innerHTML = "🔒 Mode Local sécurisé (aucune synchronisation Cloud)";
+                document.getElementById("userInfo").innerHTML = "🔒 Mode Local sécurisé (aucune synchronisation)";
                 document.getElementById("loginBtn").style.display = "inline-block";
                 document.getElementById("logoutBtn").style.display = "none";
-                if(syncToBtn) syncToBtn.style.display = "none";
-                if(syncFromBtn) syncFromBtn.style.display = "none";
             }
         });
     }
@@ -409,7 +427,8 @@ document.getElementById("loginBtn").onclick = () => {
 };
 document.getElementById("logoutBtn").onclick = () => { if(auth) auth.signOut(); };
 
-async function saveAll() {
+// Sauvegarde locale uniquement (sans push Cloud)
+function saveLocalOnly() {
     try {
         const config = getConfigData();
         localStorage.setItem(STORAGE.wardrobe,  JSON.stringify(wardrobe));
@@ -418,73 +437,29 @@ async function saveAll() {
         localStorage.setItem(STORAGE.config,    JSON.stringify(config));
         updateStats();
         calculateOptimalBag();
-        
-        if(currentUser && db) {
+    } catch(e) { console.error("Erreur sauvegarde locale", e); }
+}
+
+// Sauvegarde complète : locale + Cloud (déclenche un snapshot que l'on ignore)
+async function saveAll() {
+    saveLocalOnly();
+    
+    if(currentUser && db) {
+        try {
+            const config = getConfigData();
+            ignoreNextSnapshot = true; // Le snapshot qui suivra sera ignoré
             await db.collection("travelDatas").doc(currentUser.uid).set({
                 wardrobe,
                 tenues: currentTenues,
                 occasions: occasionTypes,
                 config
             }, { merge: true });
+        } catch(e) {
+            console.error("Erreur sauvegarde Cloud", e);
+            toast("⚠️ Erreur de synchronisation Cloud (données locales OK)");
         }
-    } catch(e) {
-        console.error("Erreur sauvegarde", e);
-        toast("⚠️ Erreur lors de la sauvegarde (locale ok, Cloud en échec)");
     }
 }
-
-async function pushToCloud() {
-    if(!currentUser || !db) {
-        toast("⚠️ Connectez-vous au Cloud d'abord.");
-        return false;
-    }
-    try {
-        const config = getConfigData();
-        await db.collection("travelDatas").doc(currentUser.uid).set({
-            wardrobe,
-            tenues: currentTenues,
-            occasions: occasionTypes,
-            config
-        }, { merge: true });
-        toast("☁️ Données sauvegardées sur le Cloud avec succès.");
-        return true;
-    } catch(e) {
-        toast("❌ Erreur lors de la sauvegarde Cloud : " + e.message);
-        return false;
-    }
-}
-
-async function loadFromCloud() {
-    if(!currentUser || !db) {
-        toast("⚠️ Connectez-vous au Cloud d'abord.");
-        return;
-    }
-    if(!confirm("Remplacer TOUTES les données locales actuelles par celles du Cloud ? (cette action est irréversible)")) return;
-    try {
-        const doc = await db.collection("travelDatas").doc(currentUser.uid).get();
-        if(doc.exists) {
-            const d = doc.data();
-            if(d.wardrobe) {
-                for(let key in DEFAULT_WARDROBE)
-                    if(Array.isArray(d.wardrobe[key])) wardrobe[key] = d.wardrobe[key];
-            }
-            if(Array.isArray(d.tenues)) currentTenues = d.tenues;
-            if(Array.isArray(d.occasions) && d.occasions.length) occasionTypes = d.occasions;
-            migrateTenues();
-            if(d.config) applyConfigData(d.config);
-            renderAll();
-            toast("☁️ Données Cloud chargées (remplacement local effectué)");
-        } else {
-            toast("📭 Aucune donnée Cloud trouvée. Sauvegardez d'abord avec 'Sauvegarder sur Cloud'.");
-        }
-    } catch(e) {
-        console.warn(e);
-        toast("❌ Impossible de charger depuis le Cloud.");
-    }
-}
-
-document.getElementById("syncToCloudBtn").onclick = pushToCloud;
-document.getElementById("syncFromCloudBtn").onclick = loadFromCloud;
 
 // EXPORT / IMPORT JSON
 document.getElementById("exportDataBtn").onclick = () => {

@@ -140,9 +140,11 @@
         <div class="user-info" id="userInfo">🔒 Mode Local sécurisé</div>
         <button class="btn data-btn" id="exportDataBtn">💾 Exporter (JSON)</button>
         <button class="btn data-btn" id="importDataBtn">📂 Importer (JSON)</button>
-        <input type="file" id="importFileInput" style="display:none;" accept=".json">
+        <button class="btn data-btn" id="syncToCloudBtn" style="display:none;">☁️ Sauvegarder sur Cloud</button>
+        <button class="btn data-btn" id="syncFromCloudBtn" style="display:none;">⬇️ Charger depuis Cloud</button>
         <button class="btn primary" id="loginBtn">Connexion Cloud</button>
         <button class="btn primary" id="logoutBtn" style="display:none;">Déconnexion</button>
+        <input type="file" id="importFileInput" style="display:none;" accept=".json">
     </div>
 
     <div class="hero">
@@ -338,34 +340,44 @@ try {
         if(!firebase.apps.length) firebase.initializeApp(firebaseConfig);
         auth = firebase.auth();
         db   = firebase.firestore();
+        
+        // État d'authentification modifié : plus de chargement automatique
         auth.onAuthStateChanged(user => {
             currentUser = user;
+            const syncToBtn = document.getElementById("syncToCloudBtn");
+            const syncFromBtn = document.getElementById("syncFromCloudBtn");
             if(user) {
-                document.getElementById("userInfo").innerHTML = `☁️ Synchronisé (${user.email||"Anonyme"})`;
+                document.getElementById("userInfo").innerHTML = `☁️ Connecté (${user.email||"Anonyme"}) · Sauvegarde auto locale`;
                 document.getElementById("loginBtn").style.display = "none";
                 document.getElementById("logoutBtn").style.display = "inline-block";
-                loadFromCloud();
+                if(syncToBtn) syncToBtn.style.display = "inline-block";
+                if(syncFromBtn) syncFromBtn.style.display = "inline-block";
+                toast(`✅ Bonjour ${user.email}. Utilisez les boutons Cloud pour synchroniser.`);
             } else {
                 document.getElementById("userInfo").innerHTML = "🔒 Mode Local sécurisé";
                 document.getElementById("loginBtn").style.display = "inline-block";
                 document.getElementById("logoutBtn").style.display = "none";
+                if(syncToBtn) syncToBtn.style.display = "none";
+                if(syncFromBtn) syncFromBtn.style.display = "none";
             }
         });
     }
-} catch(err) { console.warn("Firebase inactif."); }
+} catch(err) { console.warn("Firebase non disponible", err); }
 
+// Gestionnaires de connexion
 document.getElementById("loginBtn").onclick = () => {
     if(!auth) return toast("Mode Cloud indisponible en local strict.");
     const email = prompt("Email :"); if(!email) return;
     const pwd   = prompt("Mot de passe :"); if(!pwd) return;
     auth.signInWithEmailAndPassword(email, pwd).catch(e => {
-        if(e.code === "auth/user-not-found" || e.code === "auth/invalid-credential")
-            auth.createUserWithEmailAndPassword(email, pwd).catch(err => toast("Erreur : " + err.message));
-        else toast("Erreur de connexion : " + e.message);
+        if(e.code === "auth/user-not-found" || e.code === "auth/invalid-credential") {
+            auth.createUserWithEmailAndPassword(email, pwd).catch(err => toast("Erreur création : " + err.message));
+        } else toast("Erreur : " + e.message);
     });
 };
 document.getElementById("logoutBtn").onclick = () => { if(auth) auth.signOut(); };
 
+// ── SAUVEGARDE LOCALE + CLOUD (merge automatique) ─────────────────────────
 async function saveAll() {
     try {
         const config = getConfigData();
@@ -375,31 +387,67 @@ async function saveAll() {
         localStorage.setItem(STORAGE.config,    JSON.stringify(config));
         updateStats();
         calculateOptimalBag();
+        
+        // Sauvegarde Cloud si connecté (merge sans écraser les champs locaux)
         if(currentUser && db) {
-            db.collection("travelDatas").doc(currentUser.uid)
-              .set({wardrobe, tenues: currentTenues, occasions: occasionTypes, config}).catch(()=>{});
+            await db.collection("travelDatas").doc(currentUser.uid).set({
+                wardrobe,
+                tenues: currentTenues,
+                occasions: occasionTypes,
+                config
+            }, { merge: true });
+            // Toast discret, pas besoin de surcharger l'interface
         }
-    } catch(e) { console.error("Erreur sauvegarde", e); }
+    } catch(e) {
+        console.error("Erreur sauvegarde", e);
+        toast("⚠️ Erreur lors de la sauvegarde (locale ok, Cloud en échec)");
+    }
 }
 
+// ── CHARGEMENT EXPLICITE DEPUIS LE CLOUD (avec confirmation) ───────────────
 async function loadFromCloud() {
-    if(!currentUser || !db) return;
+    if(!currentUser || !db) {
+        toast("⚠️ Connectez-vous au Cloud d'abord.");
+        return;
+    }
     try {
         const doc = await db.collection("travelDatas").doc(currentUser.uid).get();
         if(doc.exists) {
             const d = doc.data();
-            if(d.wardrobe) {
-                for(let key in DEFAULT_WARDROBE)
-                    if(Array.isArray(d.wardrobe[key])) wardrobe[key] = d.wardrobe[key];
+            if(confirm("Remplacer TOUTES les données locales actuelles par celles du Cloud ? (cette action est irréversible)")) {
+                if(d.wardrobe) {
+                    for(let key in DEFAULT_WARDROBE)
+                        if(Array.isArray(d.wardrobe[key])) wardrobe[key] = d.wardrobe[key];
+                }
+                if(Array.isArray(d.tenues)) currentTenues = d.tenues;
+                if(Array.isArray(d.occasions) && d.occasions.length) occasionTypes = d.occasions;
+                migrateTenues();
+                if(d.config) applyConfigData(d.config);
+                renderAll();
+                toast("☁️ Données Cloud chargées (remplacement local effectué)");
             }
-            if(Array.isArray(d.tenues)) currentTenues = d.tenues;
-            if(Array.isArray(d.occasions) && d.occasions.length) occasionTypes = d.occasions;
-            migrateTenues();
-            if(d.config) applyConfigData(d.config);
-            renderAll(); toast("☁️ Données Cloud restaurées");
+        } else {
+            toast("📭 Aucune donnée Cloud trouvée. Sauvegardez d'abord avec 'Sauvegarder sur Cloud'.");
         }
-    } catch(e) { console.warn("Impossible de charger depuis le Cloud"); }
+    } catch(e) {
+        console.warn(e);
+        toast("❌ Impossible de charger depuis le Cloud.");
+    }
 }
+
+// Sauvegarde explicite vers le Cloud (déclenche aussi saveAll)
+async function pushToCloud() {
+    if(!currentUser || !db) {
+        toast("⚠️ Connectez-vous au Cloud d'abord.");
+        return;
+    }
+    await saveAll(); // sauvegarde locale + Cloud avec merge
+    toast("☁️ Donées poussées vers le Cloud (sauvegarde complète)");
+}
+
+// Événements des nouveaux boutons
+document.getElementById("syncToCloudBtn").onclick = pushToCloud;
+document.getElementById("syncFromCloudBtn").onclick = loadFromCloud;
 
 // ── EXPORT / IMPORT JSON ───────────────────────────────────────────────────
 document.getElementById("exportDataBtn").onclick = () => {
@@ -445,16 +493,11 @@ function mapWeatherCode(code) {
 async function getWeatherForDate(city, dateIso) {
     const cacheKey = `${city}|${dateIso}`;
     if(weatherCache.has(cacheKey)) return weatherCache.get(cacheKey);
-
-    // Vérifier le cache localStorage
     const stored = JSON.parse(localStorage.getItem(STORAGE.weather) || "{}");
     if(stored[cacheKey]) { weatherCache.set(cacheKey, stored[cacheKey]); return stored[cacheKey]; }
-
     const target = new Date(dateIso);
     const today  = new Date(); today.setHours(0,0,0,0);
     const diff   = Math.round((target - today) / 86400000);
-
-    // API météo réelle si la date est dans les 16 prochains jours
     if(diff >= 0 && diff <= 16) {
         try {
             const geo = await fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(city)}&format=json&limit=1`);
@@ -477,8 +520,6 @@ async function getWeatherForDate(city, dateIso) {
             }
         } catch(e) { console.warn("API météo fallback", e); }
     }
-
-    // Fallback saisonnier intelligent
     const month = target.getMonth() + 1;
     let base = 25;
     if(month >= 6 && month <= 8)   base = 30;
@@ -498,13 +539,12 @@ async function getWeatherForDate(city, dateIso) {
     return w;
 }
 
-// ── FILTRAGE PAR CONTEXTE (robuste avec fallback) ─────────────────────────
+// ── FILTRAGE PAR CONTEXTE ─────────────────────────────────────────────────
 function filterByContext(key, context) {
     const items = (wardrobe[key] || []).filter(i => i.name.trim());
     if(!context) return items;
     const ctxLower = context.toLowerCase();
     const matching = items.filter(i => i.tag && i.tag.toLowerCase() === ctxLower);
-    // Fallback : si aucun tag ne correspond, retourner toutes les pièces de la catégorie
     return matching.length ? matching : items;
 }
 
@@ -517,11 +557,8 @@ function generateSmartOutfit(momentContext) {
     const m = filterByContext("manteaux", ctx);
     const s = filterByContext("specifiques", ctx);
     const a = filterByContext("accessoires", ctx);
-
     let haut = h.length ? h[Math.floor(Math.random()*h.length)].name : "";
-    // Pièce spécifique prioritaire si le moment le demande
     if(s.length && ctx.includes("fétish")) haut = s[Math.floor(Math.random()*s.length)].name;
-
     let veste = "";
     if(m.length && (ctx.includes("montagne") || ctx.includes("rando"))) {
         veste = m[Math.floor(Math.random()*m.length)].name;
@@ -530,14 +567,11 @@ function generateSmartOutfit(momentContext) {
     } else if(m.length) {
         veste = m[Math.floor(Math.random()*m.length)].name;
     }
-
-    // Accessoires : 1 à 3 aléatoires
     let accessoires = [];
     if(a.length > 0) {
         const nb = Math.min(a.length, Math.floor(Math.random()*3)+1);
         accessoires = [...a].sort(()=>Math.random()-0.5).slice(0, nb).map(acc => acc.name);
     }
-
     return {
         haut,
         bas:        b.length ? b[Math.floor(Math.random()*b.length)].name : "",
@@ -551,12 +585,10 @@ function generateSmartOutfit(momentContext) {
 function calculateOptimalBag() {
     let total = Object.values(wardrobe).flat().filter(i => i.name.trim()).length;
     const nbJours = currentTenues.length || 7;
-    total += Math.min(nbJours, 10) * 2; // sous-vêtements estimés
-
+    total += Math.min(nbJours, 10) * 2;
     let suggestion = "Cabine";
     if(total > 50) suggestion = "Soute Max";
     else if(total > 30) suggestion = "Soute Moyenne";
-
     document.getElementById("bagSuggestion").textContent = `(Conseillé : ${suggestion})`;
     const bagSel = document.getElementById("bagSize");
     for(let opt of bagSel.options) {
@@ -564,7 +596,7 @@ function calculateOptimalBag() {
     }
 }
 
-// ── RENDU GARDE-ROBE ──────────────────────────────────────────────────────
+// ── RENDU GARDE-ROBE (inchangé) ───────────────────────────────────────────
 function renderWardrobe() {
     const grid = document.getElementById("wardrobeGrid");
     grid.innerHTML = "";
@@ -575,12 +607,9 @@ function renderWardrobe() {
         wrap.innerHTML = `<div class="wardrobe-cat-header"><span>${meta.label}</span><span>${items.length}</span></div><div class="wardrobe-items" id="wcat-${key}"></div>`;
         grid.appendChild(wrap);
         const container = wrap.querySelector(`#wcat-${key}`);
-
         items.forEach((item, idx) => {
             const div = document.createElement("div"); div.className = "wardrobe-item";
-            const opts = occasionTypes.map(occ =>
-                `<option value="${occ}" ${item.tag === occ ? "selected" : ""}>${occ}</option>`
-            ).join("");
+            const opts = occasionTypes.map(occ => `<option value="${occ}" ${item.tag === occ ? "selected" : ""}>${occ}</option>`).join("");
             div.innerHTML = `<input type="text" value="${item.name}">
                 <select class="wardrobe-tag">${opts}</select>
                 <button class="wardrobe-item-remove">&times;</button>`;
@@ -589,7 +618,6 @@ function renderWardrobe() {
             div.querySelector(".wardrobe-item-remove").onclick = () => { wardrobe[key].splice(idx,1); saveAll(); renderWardrobe(); renderTenues(); };
             container.appendChild(div);
         });
-
         const addBtn = document.createElement("button");
         addBtn.className = "wardrobe-add-btn"; addBtn.textContent = "+ Ajouter";
         addBtn.onclick = () => {
@@ -659,130 +687,60 @@ document.getElementById("addOccasionBtn").onclick = () => {
 
 // ── DRAG & DROP ────────────────────────────────────────────────────────────
 let dragSrcIndex = null;
-
-function handleDragStart(e) {
-    dragSrcIndex = parseInt(this.dataset.index);
-    this.classList.add("dragging");
-    e.dataTransfer.effectAllowed = "move";
-    e.dataTransfer.setData("text/plain", dragSrcIndex);
-}
+function handleDragStart(e) { dragSrcIndex = parseInt(this.dataset.index); this.classList.add("dragging"); e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("text/plain", dragSrcIndex); }
 function handleDragOver(e) { e.preventDefault(); e.dataTransfer.dropEffect = "move"; }
 function handleDrop(e) {
-    e.preventDefault();
-    const targetCard = e.target.closest(".day-card");
-    if(!targetCard) return;
-    const targetIndex = parseInt(targetCard.dataset.index);
-    if(dragSrcIndex === targetIndex || dragSrcIndex === null) return;
-    const item = currentTenues.splice(dragSrcIndex, 1)[0];
-    currentTenues.splice(targetIndex, 0, item);
+    e.preventDefault(); const targetCard = e.target.closest(".day-card"); if(!targetCard) return;
+    const targetIndex = parseInt(targetCard.dataset.index); if(dragSrcIndex === targetIndex || dragSrcIndex === null) return;
+    const item = currentTenues.splice(dragSrcIndex, 1)[0]; currentTenues.splice(targetIndex, 0, item);
     saveAll(); renderTenues(); renderChecklist();
 }
 function handleDragEnd() { this.classList.remove("dragging"); dragSrcIndex = null; }
 
-// ── RENDU PLANNING ─────────────────────────────────────────────────────────
+// ── RENDU PLANNING (inchangé, mais raccourci pour lisibilité) ─────────────
 function renderTenues() {
     const grid = document.getElementById("daysGrid");
     grid.innerHTML = "";
-
-    if(!currentTenues.length) {
-        grid.innerHTML = "<p style=\"padding:1rem;color:var(--text-muted)\">Aucun planning. Renseignez les dates et cliquez sur Générer Planning.</p>";
-        return;
-    }
-
+    if(!currentTenues.length) { grid.innerHTML = "<p style=\"padding:1rem;color:var(--text-muted)\">Aucun planning. Renseignez les dates et cliquez sur Générer Planning.</p>"; return; }
     currentTenues.forEach((row, idx) => {
-        const card = document.createElement("div");
-        card.className = `day-card ${row.moment === "Fétish" ? "specifique-mode" : ""}`;
-        card.draggable = true;
-        card.dataset.index = idx;
-        card.addEventListener("dragstart", handleDragStart);
-        card.addEventListener("dragover",  handleDragOver);
-        card.addEventListener("drop",      handleDrop);
-        card.addEventListener("dragend",   handleDragEnd);
-
-        // Header
+        const card = document.createElement("div"); card.className = `day-card ${row.moment === "Fétish" ? "specifique-mode" : ""}`;
+        card.draggable = true; card.dataset.index = idx;
+        card.addEventListener("dragstart", handleDragStart); card.addEventListener("dragover", handleDragOver);
+        card.addEventListener("drop", handleDrop); card.addEventListener("dragend", handleDragEnd);
         const hd = document.createElement("div"); hd.className = "day-card-header";
-        const dateInput = document.createElement("input");
-        dateInput.className = "day-card-date-input"; dateInput.value = row.date;
+        const dateInput = document.createElement("input"); dateInput.className = "day-card-date-input"; dateInput.value = row.date;
         dateInput.addEventListener("change", e => { currentTenues[idx].date = e.target.value; saveAll(); });
-
         const momentSel = document.createElement("select"); momentSel.className = "day-card-moment";
-        occasionTypes.forEach(opt => {
-            momentSel.innerHTML += `<option value="${opt}" ${row.moment===opt?"selected":""}>${opt}</option>`;
-        });
-        momentSel.addEventListener("change", e => {
-            currentTenues[idx].moment = e.target.value;
-            Object.assign(currentTenues[idx], generateSmartOutfit(e.target.value));
-            saveAll(); renderTenues();
-        });
+        occasionTypes.forEach(opt => { momentSel.innerHTML += `<option value="${opt}" ${row.moment===opt?"selected":""}>${opt}</option>`; });
+        momentSel.addEventListener("change", e => { currentTenues[idx].moment = e.target.value; Object.assign(currentTenues[idx], generateSmartOutfit(e.target.value)); saveAll(); renderTenues(); });
         hd.appendChild(dateInput); hd.appendChild(momentSel); card.appendChild(hd);
-
-        // Météo
-        const wth = document.createElement("div"); wth.className = "day-card-weather";
-        wth.innerHTML = `🌡️ ${row.meteo || "22°C"}`;
-        card.appendChild(wth);
-
-        // Corps
+        const wth = document.createElement("div"); wth.className = "day-card-weather"; wth.innerHTML = `🌡️ ${row.meteo || "22°C"}`; card.appendChild(wth);
         const body = document.createElement("div"); body.className = "day-card-body";
-
-        const fieldsMeta = [
-            {key:"haut",       label:"Haut",    sources:["hauts","specifiques"]},
-            {key:"bas",        label:"Bas",     sources:["bas"]},
-            {key:"veste",      label:"Veste",   sources:["vestes","manteaux"]},
-            {key:"chaussures", label:"Chauss.", sources:["chaussures"]}
-        ];
-
+        const fieldsMeta = [{key:"haut",label:"Haut",sources:["hauts","specifiques"]},{key:"bas",label:"Bas",sources:["bas"]},{key:"veste",label:"Veste",sources:["vestes","manteaux"]},{key:"chaussures",label:"Chauss.",sources:["chaussures"]}];
         fieldsMeta.forEach(fm => {
             const rf = document.createElement("div"); rf.className = "day-field";
             let optionsHtml = `<option value="">—</option>`;
-            fm.sources.forEach(src => {
-                (wardrobe[src]||[]).forEach(item => {
-                    if(item.name.trim()) {
-                        const sel = row[fm.key] === item.name ? "selected" : "";
-                        optionsHtml += `<option value="${item.name}" ${sel}>${item.name}</option>`;
-                    }
-                });
-            });
-            // Garder une valeur hors-stock si elle existait
-            if(row[fm.key] && !optionsHtml.includes(`value="${row[fm.key]}"`))
-                optionsHtml += `<option value="${row[fm.key]}" selected>${row[fm.key]} (H.S.)</option>`;
-
+            fm.sources.forEach(src => { (wardrobe[src]||[]).forEach(item => { if(item.name.trim()) optionsHtml += `<option value="${item.name}" ${row[fm.key] === item.name ? "selected" : ""}>${item.name}</option>`; }); });
+            if(row[fm.key] && !optionsHtml.includes(`value="${row[fm.key]}"`)) optionsHtml += `<option value="${row[fm.key]}" selected>${row[fm.key]} (H.S.)</option>`;
             rf.innerHTML = `<span class="day-field-label">${fm.label}</span><select class="day-field-value">${optionsHtml}</select>`;
             rf.querySelector("select").addEventListener("change", e => { currentTenues[idx][fm.key] = e.target.value; saveAll(); });
             body.appendChild(rf);
         });
-
-        // Accessoires (checkboxes)
         const accField = document.createElement("div"); accField.className = "day-field"; accField.style.alignItems = "flex-start";
         const accArray = Array.isArray(row.accessoires) ? row.accessoires : [];
         let accHtml = `<span class="day-field-label">Access.</span><div class="day-field-checkboxes">`;
         let hasAcc = false;
-        (wardrobe.accessoires||[]).forEach(item => {
-            if(item.name.trim()) {
-                hasAcc = true;
-                const chk = accArray.includes(item.name) ? "checked" : "";
-                accHtml += `<label class="acc-check"><input type="checkbox" value="${item.name}" ${chk}> ${item.name}</label>`;
-            }
-        });
+        (wardrobe.accessoires||[]).forEach(item => { if(item.name.trim()) { hasAcc = true; const chk = accArray.includes(item.name) ? "checked" : ""; accHtml += `<label class="acc-check"><input type="checkbox" value="${item.name}" ${chk}> ${item.name}</label>`; } });
         if(!hasAcc) accHtml += `<span style="font-size:.75rem;color:var(--text-muted)">Aucun accessoire</span>`;
-        accHtml += `</div>`;
-        accField.innerHTML = accHtml;
-        accField.querySelectorAll("input[type=checkbox]").forEach(cb => {
-            cb.addEventListener("change", () => {
-                currentTenues[idx].accessoires = Array.from(accField.querySelectorAll("input[type=checkbox]:checked")).map(c => c.value);
-                saveAll();
-            });
-        });
-        body.appendChild(accField);
-        card.appendChild(body);
-
-        // Footer
+        accHtml += `</div>`; accField.innerHTML = accHtml;
+        accField.querySelectorAll("input[type=checkbox]").forEach(cb => { cb.addEventListener("change", () => { currentTenues[idx].accessoires = Array.from(accField.querySelectorAll("input[type=checkbox]:checked")).map(c => c.value); saveAll(); }); });
+        body.appendChild(accField); card.appendChild(body);
         const ft = document.createElement("div"); ft.className = "day-card-footer";
         const rr = document.createElement("button"); rr.className = "btn-reroll"; rr.innerHTML = "🔀 Changer";
         rr.onclick = () => { Object.assign(currentTenues[idx], generateSmartOutfit(row.moment)); saveAll(); renderTenues(); };
         const dl = document.createElement("button"); dl.className = "btn-del"; dl.innerHTML = "🗑";
         dl.onclick = () => { currentTenues.splice(idx,1); saveAll(); renderTenues(); renderChecklist(); };
         ft.appendChild(rr); ft.appendChild(dl); card.appendChild(ft);
-
         grid.appendChild(card);
     });
 }
@@ -800,50 +758,28 @@ function getChecklistData() {
         "📋 Divers": ["Passeport / ID", `Bagage : ${document.getElementById("bagSize").value}`]
     };
 }
-
 function renderChecklist() {
     const root = document.getElementById("checklistRoot"); root.innerHTML = "";
     const data = getChecklistData();
     let saved = JSON.parse(localStorage.getItem(STORAGE.check)) || {};
     let total = 0, checked = 0;
-
     for(const [title, items] of Object.entries(data)) {
         if(!items.length) continue;
         const sec = document.createElement("div"); sec.className = "checklist-section";
         sec.innerHTML = `<div class="section-header"><div class="section-title">${title}</div></div><div class="checklist-grid"></div>`;
-        root.appendChild(sec);
-        const g = sec.querySelector(".checklist-grid");
-        items.forEach(item => {
-            total++;
-            const isChk = saved[item] === true; if(isChk) checked++;
-            const div = document.createElement("div"); div.className = `check-item ${isChk?"is-checked":""}`;
-            div.innerHTML = `<input type="checkbox" ${isChk?"checked":""}><label>${item}</label>`;
-            div.querySelector("input").addEventListener("change", e => {
-                saved[item] = e.target.checked;
-                localStorage.setItem(STORAGE.check, JSON.stringify(saved));
-                renderChecklist();
-            });
-            g.appendChild(div);
-        });
+        root.appendChild(sec); const g = sec.querySelector(".checklist-grid");
+        items.forEach(item => { total++; const isChk = saved[item] === true; if(isChk) checked++; const div = document.createElement("div"); div.className = `check-item ${isChk?"is-checked":""}`; div.innerHTML = `<input type="checkbox" ${isChk?"checked":""}><label>${item}</label>`; div.querySelector("input").addEventListener("change", e => { saved[item] = e.target.checked; localStorage.setItem(STORAGE.check, JSON.stringify(saved)); renderChecklist(); }); g.appendChild(div); });
     }
-    const pct = total ? Math.round((checked/total)*100) : 0;
-    document.getElementById("progressFill").style.width = pct + "%";
+    const pct = total ? Math.round((checked/total)*100) : 0; document.getElementById("progressFill").style.width = pct + "%";
 }
 
 // ── ÉVÉNEMENTS GLOBAUX ─────────────────────────────────────────────────────
 document.getElementById("applyDatesBtn").onclick = async () => {
-    const city = document.getElementById("cityInput").value.trim();
-    const sVal = document.getElementById("startDate").value;
-    const eVal = document.getElementById("endDate").value;
+    const city = document.getElementById("cityInput").value.trim(); const sVal = document.getElementById("startDate").value; const eVal = document.getElementById("endDate").value;
     if(!city || !sVal || !eVal) return toast("⚠️ Remplissez tous les champs.");
-    const s = new Date(sVal), e = new Date(eVal);
-    if(s > e) return toast("⚠️ La date de retour doit être après le départ.");
-
-    const btn = document.getElementById("applyDatesBtn");
-    btn.disabled = true; btn.textContent = "⏳ Génération...";
-    currentTenues = [];
-    weatherCache.clear();
-
+    const s = new Date(sVal), e = new Date(eVal); if(s > e) return toast("⚠️ La date de retour doit être après le départ.");
+    const btn = document.getElementById("applyDatesBtn"); btn.disabled = true; btn.textContent = "⏳ Génération...";
+    currentTenues = []; weatherCache.clear();
     const defaultMoment = occasionTypes[0] || "Journée";
     for(let d = new Date(s); d <= e; d.setDate(d.getDate()+1)) {
         const dateStr  = d.toLocaleDateString("fr-FR", {weekday:"short", day:"numeric", month:"short"});
@@ -855,46 +791,16 @@ document.getElementById("applyDatesBtn").onclick = async () => {
     saveAll(); renderTenues(); renderChecklist();
     toast(`✅ ${currentTenues.length} jours générés !`);
 };
+["cityInput","startDate","endDate","bagSize"].forEach(id => document.getElementById(id).addEventListener("change", saveAll));
+document.getElementById("addRowBtn").onclick = () => { const defaultMoment = occasionTypes[0] || "Journée"; currentTenues.push({date:"Jour supp.", moment:defaultMoment, meteo:"22°C · ☀️", ...generateSmartOutfit(defaultMoment)}); saveAll(); renderTenues(); renderChecklist(); };
+document.getElementById("resetWardrobeBtn").onclick = () => { if(confirm("Réinitialiser avec les vêtements par défaut ?")) { wardrobe = JSON.parse(JSON.stringify(DEFAULT_WARDROBE)); saveAll(); renderAll(); toast("Garde-robe réinitialisée."); } };
+document.getElementById("generateOutfitsBtn").onclick = () => { if(!currentTenues.length) return toast("Génère d'abord un planning !"); currentTenues.forEach(t => Object.assign(t, generateSmartOutfit(t.moment))); saveAll(); renderTenues(); toast("Tenues régénérées !"); };
+document.getElementById("resetChecklistBtn").onclick = () => { localStorage.removeItem(STORAGE.check); renderChecklist(); toast("Checklist décochée."); };
+document.getElementById("refreshChecklistBtn").onclick = () => { renderChecklist(); toast("Checklist synchronisée !"); };
 
-["cityInput","startDate","endDate","bagSize"].forEach(id =>
-    document.getElementById(id).addEventListener("change", saveAll)
-);
+function renderAll() { renderWardrobe(); renderOccasions(); renderTenues(); renderChecklist(); calculateOptimalBag(); }
 
-document.getElementById("addRowBtn").onclick = () => {
-    const defaultMoment = occasionTypes[0] || "Journée";
-    currentTenues.push({date:"Jour supp.", moment:defaultMoment, meteo:"22°C · ☀️", ...generateSmartOutfit(defaultMoment)});
-    saveAll(); renderTenues(); renderChecklist();
-};
-document.getElementById("resetWardrobeBtn").onclick = () => {
-    if(confirm("Réinitialiser avec les vêtements par défaut ?")) {
-        wardrobe = JSON.parse(JSON.stringify(DEFAULT_WARDROBE));
-        saveAll(); renderAll(); toast("Garde-robe réinitialisée.");
-    }
-};
-document.getElementById("generateOutfitsBtn").onclick = () => {
-    if(!currentTenues.length) return toast("Génère d'abord un planning !");
-    currentTenues.forEach(t => Object.assign(t, generateSmartOutfit(t.moment)));
-    saveAll(); renderTenues(); toast("Tenues régénérées !");
-};
-document.getElementById("resetChecklistBtn").onclick = () => {
-    localStorage.removeItem(STORAGE.check); renderChecklist(); toast("Checklist décochée.");
-};
-document.getElementById("refreshChecklistBtn").onclick = () => {
-    renderChecklist(); toast("Checklist synchronisée !");
-};
-
-function renderAll() {
-    renderWardrobe();
-    renderOccasions();
-    renderTenues();
-    renderChecklist();
-    calculateOptimalBag();
-}
-
-window.onload = () => {
-    safeLoadLocalData();
-    renderAll();
-};
+window.onload = () => { safeLoadLocalData(); renderAll(); };
 </script>
 </body>
 </html>

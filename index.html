@@ -328,9 +328,12 @@ let auth = null, db = null, currentUser = null;
 try {
     if(typeof firebase !== "undefined") {
         const firebaseConfig = {
-            apiKey: "AIzaSyDoz40hqFmhbr0pKj8O83M5yaIftkavpuA",
-            authDomain: "voyage-malin.firebaseapp.com",
-            projectId: "voyage-malin"
+            apiKey: "AIzaSyCQMcM3k4y0BqZETQ8NM1bpmK6vtYDdmsE",
+            authDomain: "voyage-malin-28028.firebaseapp.com",
+            projectId: "voyage-malin-28028",
+            storageBucket: "voyage-malin-28028.firebasestorage.app",
+            messagingSenderId: "1070035597338",
+            appId: "1:1070035597338:web:58fbe7e5b943cc9bcdf9a3"
         };
         if(!firebase.apps.length) firebase.initializeApp(firebaseConfig);
         auth = firebase.auth();
